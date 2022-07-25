@@ -1,0 +1,253 @@
+---
+title: "Working with PRISM Climate Normals in R"
+date: "July 24, 2022"
+output:
+  html_notebook: 
+    css: css/nb_css01.css
+    includes:
+      before_body: header_igis.html
+---
+
+## Summary 
+
+In this notebook, we will download the annual average precipitation for the USA, crop it to California, and identify the area which gets 200-400mm of rainfall.
+
+The data we'll use is the 30-Year climate normals from [PRISM](https://prism.oregonstate.edu/normals/). These data are based on observed values (i.e., from weather stations), that have been interpolated for the entire USA. The 30-year normals are the average annual values or average monthly values, computed from 1991-2020. 
+
+The data are available at 4km and 800m resolution, and include the following variables:
+
+- precipitation
+- temperature (min, mean, max)
+- dew point (mean)
+- vapor pressure deficit (min and max)
+- solar radiation (horizontal and sloped)
+- cloud transmission  
+- elevation
+
+In this demo, we'll use the 4km resolution data (but the code should work with the 800m data as well).
+
+\
+
+## Setup
+
+Load packages:
+
+```{r message = FALSE, results = 'hide'}
+library(terra)
+library(dplyr)
+library(magrittr)
+library(units)
+```
+
+\
+
+Define the data directory:
+
+```{r}
+data_dir <- "D:/GIS/Data/USA/PRISM/PR-annual_30yr-norm_4k"  ## windows users - note the forward slashes!
+if (!file.exists(data_dir)) stop("Can't find the data directory")
+```
+
+\
+
+&#9758; If you haven't already, download the average annual precipitation values from [PRISM](https://prism.oregonstate.edu/normals/). Download the data as .bil, and unzip the zip file to the data directory. 
+
+You should see these files:
+
+```{r}
+list.files(data_dir)
+```
+
+Although there are bunch of files in the zip, the file we import is the `.bil`:
+
+\
+
+## Import the 30-year average annual precipitation raster
+
+Import the `.bil`:
+
+```{r}
+pr4k_usa_fn <- file.path(data_dir, "PRISM_ppt_30yr_normal_4kmM3_annual_bil.bil")
+file.exists(pr4k_usa_fn)
+```
+
+\
+
+Import with `terra::rast()`:
+
+```{r}
+pr4k_usa_sprst <- rast(pr4k_usa_fn)
+pr4k_usa_sprst
+```
+
+We note the raster is in geographic coordinates (NAD83) and the units are mm. 
+
+\
+
+Plot it:
+
+```{r}
+plot(pr4k_usa_sprst)
+```
+
+
+## Import the California State Boundary
+
+Next we'll import the California State boundary (which we'll need to crop the USA data). 
+
+```{r}
+cabnd_4326_fn <- "./geoms/ca_bnd_4326.geojson"
+file.exists(cabnd_4326_fn)
+cabnd_4326_spvec <- vect(cabnd_4326_fn)
+plot(cabnd_4326_spvec)
+```
+
+\
+
+## Crop the Raster to California
+
+Before we can crop the raster, we need to project the state border. They're both in geographic coordinates, but the state border uses the WGS84 data, and the raster uses the NAD83 datum.
+
+```{r paged.print=FALSE}
+cabnd_nad83_spvec <- project(cabnd_4326_spvec, pr4k_usa_sprst)
+cabnd_nad83_spvec
+```
+
+\
+
+Now we can crop the raster. Note we are also masking it such that values outside CA will be `NA`:
+
+```{r}
+pr4k_ca_sprst <- crop(pr4k_usa_sprst, cabnd_nad83_spvec, mask = TRUE)
+plot(pr4k_ca_sprst, main = "Avg. Annual Precip in CA (mm) (1991-2020)")
+```
+
+\
+
+## Project the Precip Data to Albers
+
+The precipitation raster has been clipped to California, but it is still in geographic coordinates. Because our goal is to get the area of the zone that receives 200-400mm of rainfall on average, we need to project this to coordinate system that has a real-world unit like meters.
+
+We'll project the raster to California Teal Albers which is used by most state agencies.
+
+```{r}
+pr4k_ca_alb_sprst <- project(x = pr4k_ca_sprst, y = "epsg:3310", method = "bilinear", res = 4000)
+pr4k_ca_alb_sprst
+plot(pr4k_ca_alb_sprst)
+```
+
+This plot looks very similar to the one above, the only difference is the axes now show meters instead of degrees.
+
+\
+
+## Classify the Precipitation Raster 
+
+Next we'll reclassify the pixels into three buckets:
+
+- 0-200mm: 1 (low)  
+- 200-400mm: 2 (medium)  
+- 400-5000: 3 (high)  
+
+Step one is to build a 3-column matrix:
+
+```{r}
+rcl_mat <- matrix(c(0,200,1,200,400,2,400,5000,3), ncol = 3, byrow = TRUE)
+rcl_mat
+```
+
+\
+
+Now we can reclassify:
+
+```{r}
+pr4k_lowmedhigh_sprst <- classify(pr4k_ca_alb_sprst, rcl = rcl_mat)
+plot(pr4k_lowmedhigh_sprst, col = c("BlanchedAlmond", "Aquamarine", "LightSkyBlue"))
+```
+
+The area we're interested in the middle zone shown in light green.
+
+\
+
+## Measure the area of the 200-400mm zone{}
+
+To measure area of a zone, we'll multiply the number of pixels in that zone times the pixel area.
+
+```{r}
+res(pr4k_lowmedhigh_sprst)
+pixel_area_m2 <- prod(res(pr4k_lowmedhigh_sprst)) %>% set_units(m^2)
+pixel_area_m2
+```
+
+\
+
+Now we can get the area that gets 200-400mm:
+
+```{r}
+pr_mid_area_m2 <- pr4k_lowmedhigh_sprst %>% 
+  values() %>% 
+  equals(2) %>% 
+  sum(na.rm = TRUE) * 
+  pixel_area_m2
+
+pr_mid_area_m2 %>% format(scientific = FALSE, big.mark = ",")
+```
+
+\
+
+Converting this area to other units:
+
+```{r}
+pr_mid_area_m2 %>% set_units(km^2) %>% format(scientific = FALSE, big.mark = ",")
+pr_mid_area_m2 %>% set_units(acres) %>% format(scientific = FALSE, big.mark = ",")
+pr_mid_area_m2 %>% set_units(mi^2) %>% format(scientific = FALSE, big.mark = ",")
+```
+
+\
+
+## Export Data
+
+Finally we can export the results to standard GIS file formats:
+
+```{r}
+out_dir <- "D:/GIS/Data/CA/PRISM"
+out_fn <- file.path(out_dir, "pr-annual-avg_30yr-norm_1991-2020_4k.tif")
+if (!file.exists(out_fn)) terra::writeRaster(pr4k_ca_alb_sprst, out_fn)
+```
+
+\
+
+## Convert the 200-400mm region to vector
+
+\
+
+Pull out the 200-400mm region with reclassify:
+
+```{r}
+(rcl_mat <- matrix(c(0,200,NA,200,400,1,400,5000,NA), ncol = 3, byrow = TRUE))
+(pr4k_200400mm_sprst <- classify(pr4k_ca_alb_sprst, rcl = rcl_mat))
+plot(pr4k_200400mm_sprst)
+```
+
+\
+
+Convert to vector:
+
+```{r}
+library(sf)
+pr4k_200400mm_sf <- pr4k_200400mm_sprst %>% 
+  as.polygons(dissolve=TRUE) %>% 
+  st_as_sf() %>% 
+  st_sf() %>% 
+  transmute(precip = "200-400mm") 
+
+plot(pr4k_200400mm_sf$geom)
+```
+
+Now we can export:
+
+```{r}
+out_fn <- file.path("~/R/users/MacDonald", "pr-annual-avg_30yr-norm_1991-2020_200-400mm_4k.shp")
+if (!file.exists(out_fn)) st_write(pr4k_200400mm_sf, out_fn)
+```
+
+\
